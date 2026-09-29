@@ -1,0 +1,916 @@
+import os
+import sqlite3
+import time
+from datetime import datetime
+
+import telebot
+from telebot import types
+
+
+# =========================================================
+# SOZLAMALAR
+# =========================================================
+
+BOT_TOKEN = "8806238942:AAGcO1Hi2R1-ZaICdhB2I-By_sfi4ucOG3w")
+
+ADMIN_ID = 8694801795
+
+DB_NAME = "books.db"
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN topilmadi. GitHub Secrets ichiga BOT_TOKEN qo'shing.")
+
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
+
+
+# =========================================================
+# DATABASE
+# =========================================================
+
+def db():
+    con = sqlite3.connect(DB_NAME, check_same_thread=False)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def init_db():
+    con = db()
+    cur = con.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS books (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            file_id TEXT NOT NULL,
+            file_name TEXT,
+            uploaded_by INTEGER,
+            downloads INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            first_name TEXT,
+            username TEXT,
+            joined_at TEXT NOT NULL
+        )
+    """)
+
+    con.commit()
+    con.close()
+
+
+init_db()
+
+
+# =========================================================
+# YORDAMCHI FUNKSIYALAR
+# =========================================================
+
+def is_admin(user_id):
+    return user_id == ADMIN_ID
+
+
+def save_user(user):
+    con = db()
+    cur = con.cursor()
+
+    cur.execute("""
+        INSERT OR REPLACE INTO users
+        (user_id, first_name, username, joined_at)
+        VALUES (
+            ?,
+            ?,
+            ?,
+            COALESCE(
+                (SELECT joined_at FROM users WHERE user_id = ?),
+                ?
+            )
+        )
+    """, (
+        user.id,
+        user.first_name or "",
+        user.username or "",
+        user.id,
+        datetime.now().isoformat()
+    ))
+
+    con.commit()
+    con.close()
+
+
+def add_book(title, file_id, file_name, uploaded_by):
+    con = db()
+    cur = con.cursor()
+
+    cur.execute("""
+        INSERT INTO books
+        (title, file_id, file_name, uploaded_by, created_at)
+        VALUES (?, ?, ?, ?, ?)
+    """, (
+        title,
+        file_id,
+        file_name,
+        uploaded_by,
+        datetime.now().isoformat()
+    ))
+
+    book_id = cur.lastrowid
+
+    con.commit()
+    con.close()
+
+    return book_id
+
+
+def get_book(book_id):
+    con = db()
+    cur = con.cursor()
+
+    cur.execute(
+        "SELECT * FROM books WHERE id = ?",
+        (book_id,)
+    )
+
+    book = cur.fetchone()
+
+    con.close()
+
+    return book
+
+
+def search_books(text):
+    con = db()
+    cur = con.cursor()
+
+    cur.execute("""
+        SELECT * FROM books
+        WHERE title LIKE ?
+        ORDER BY id DESC
+        LIMIT 20
+    """, (f"%{text}%",))
+
+    books = cur.fetchall()
+
+    con.close()
+
+    return books
+
+
+def get_new_books():
+    con = db()
+    cur = con.cursor()
+
+    cur.execute("""
+        SELECT * FROM books
+        ORDER BY id DESC
+        LIMIT 10
+    """)
+
+    books = cur.fetchall()
+
+    con.close()
+
+    return books
+
+
+def get_popular_books():
+    con = db()
+    cur = con.cursor()
+
+    cur.execute("""
+        SELECT * FROM books
+        ORDER BY downloads DESC, id DESC
+        LIMIT 10
+    """)
+
+    books = cur.fetchall()
+
+    con.close()
+
+    return books
+
+
+def increase_download(book_id):
+    con = db()
+    cur = con.cursor()
+
+    cur.execute("""
+        UPDATE books
+        SET downloads = downloads + 1
+        WHERE id = ?
+    """, (book_id,))
+
+    con.commit()
+    con.close()
+
+
+def delete_book(book_id):
+    con = db()
+    cur = con.cursor()
+
+    cur.execute(
+        "DELETE FROM books WHERE id = ?",
+        (book_id,)
+    )
+
+    deleted = cur.rowcount
+
+    con.commit()
+    con.close()
+
+    return deleted > 0
+
+
+# =========================================================
+# ASOSIY MENYU
+# =========================================================
+
+def main_menu(user_id):
+
+    markup = types.ReplyKeyboardMarkup(
+        resize_keyboard=True
+    )
+
+    markup.row(
+        "📚 Kitoblar",
+        "🔎 Qidirish"
+    )
+
+    markup.row(
+        "🆕 Yangi kitoblar",
+        "⭐ Mashhur kitoblar"
+    )
+
+    markup.row(
+        "📤 Kitob yuborish",
+        "ℹ️ Yordam"
+    )
+
+    if is_admin(user_id):
+        markup.row("🛠 Admin panel")
+
+    return markup
+
+
+# =========================================================
+# /START
+# =========================================================
+
+@bot.message_handler(commands=["start"])
+def start(message):
+
+    save_user(message.from_user)
+
+    text = (
+        "📚 <b>ONLAYN KUTUBXONA</b>\n\n"
+        "Kitoblar olamiga xush kelibsiz!\n\n"
+        "Kerakli bo‘limni tanlang 👇"
+    )
+
+    bot.send_message(
+        message.chat.id,
+        text,
+        reply_markup=main_menu(message.from_user.id)
+    )
+
+
+# =========================================================
+# KITOBLAR
+# =========================================================
+
+@bot.message_handler(func=lambda m: m.text == "📚 Kitoblar")
+def books_menu(message):
+
+    books = get_new_books()
+
+    if not books:
+        bot.send_message(
+            message.chat.id,
+            "📚 Hozircha kitoblar mavjud emas."
+        )
+        return
+
+    markup = types.InlineKeyboardMarkup()
+
+    for book in books:
+        title = book["title"]
+
+        if len(title) > 35:
+            title = title[:35] + "..."
+
+        markup.add(
+            types.InlineKeyboardButton(
+                f"📖 {title}",
+                callback_data=f"book_{book['id']}"
+            )
+        )
+
+    bot.send_message(
+        message.chat.id,
+        "📚 <b>Kitoblar:</b>\n\nKerakli kitobni tanlang 👇",
+        reply_markup=markup
+    )
+
+
+# =========================================================
+# KITOBNI YUBORISH
+# =========================================================
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("book_"))
+def send_book(call):
+
+    try:
+        book_id = int(call.data.split("_")[1])
+    except:
+        bot.answer_callback_query(
+            call.id,
+            "❌ Xatolik"
+        )
+        return
+
+    book = get_book(book_id)
+
+    if not book:
+        bot.answer_callback_query(
+            call.id,
+            "❌ Kitob topilmadi."
+        )
+        return
+
+    bot.answer_callback_query(
+        call.id,
+        "📚 Kitob tayyorlanmoqda..."
+    )
+
+    caption = (
+        f"📖 <b>{book['title']}</b>\n\n"
+        f"⬇️ Yuklab olish uchun faylni bosing."
+    )
+
+    try:
+        bot.send_document(
+            call.message.chat.id,
+            book["file_id"],
+            caption=caption
+        )
+
+        increase_download(book_id)
+
+    except Exception as e:
+
+        bot.send_message(
+            call.message.chat.id,
+            "❌ Kitobni yuborishda xatolik yuz berdi."
+        )
+
+        print("SEND BOOK ERROR:", e)
+
+
+# =========================================================
+# QIDIRISH
+# =========================================================
+
+@bot.message_handler(func=lambda m: m.text == "🔎 Qidirish")
+def search_start(message):
+
+    msg = bot.send_message(
+        message.chat.id,
+        "🔎 <b>Kitob nomini yozing:</b>\n\n"
+        "Masalan: <i>Alpomish</i>"
+    )
+
+    bot.register_next_step_handler(msg, search_process)
+
+
+def search_process(message):
+
+    query = message.text.strip()
+
+    if not query:
+        bot.send_message(
+            message.chat.id,
+            "❌ Qidiruv so‘zi bo‘sh bo‘lmasin."
+        )
+        return
+
+    books = search_books(query)
+
+    if not books:
+        bot.send_message(
+            message.chat.id,
+            "❌ Bunday kitob topilmadi."
+        )
+        return
+
+    markup = types.InlineKeyboardMarkup()
+
+    for book in books:
+
+        title = book["title"]
+
+        if len(title) > 35:
+            title = title[:35] + "..."
+
+        markup.add(
+            types.InlineKeyboardButton(
+                f"📖 {title}",
+                callback_data=f"book_{book['id']}"
+            )
+        )
+
+    bot.send_message(
+        message.chat.id,
+        f"🔎 <b>Natijalar:</b> {len(books)} ta",
+        reply_markup=markup
+    )
+
+
+# =========================================================
+# YANGI KITOBLAR
+# =========================================================
+
+@bot.message_handler(func=lambda m: m.text == "🆕 Yangi kitoblar")
+def new_books(message):
+
+    books = get_new_books()
+
+    if not books:
+        bot.send_message(
+            message.chat.id,
+            "🆕 Hozircha yangi kitoblar yo‘q."
+        )
+        return
+
+    markup = types.InlineKeyboardMarkup()
+
+    for book in books:
+
+        title = book["title"]
+
+        if len(title) > 35:
+            title = title[:35] + "..."
+
+        markup.add(
+            types.InlineKeyboardButton(
+                f"🆕 {title}",
+                callback_data=f"book_{book['id']}"
+            )
+        )
+
+    bot.send_message(
+        message.chat.id,
+        "🆕 <b>Eng yangi kitoblar:</b>",
+        reply_markup=markup
+    )
+
+
+# =========================================================
+# MASHHUR KITOBLAR
+# =========================================================
+
+@bot.message_handler(func=lambda m: m.text == "⭐ Mashhur kitoblar")
+def popular_books(message):
+
+    books = get_popular_books()
+
+    if not books:
+        bot.send_message(
+            message.chat.id,
+            "⭐ Hozircha mashhur kitoblar yo‘q."
+        )
+        return
+
+    markup = types.InlineKeyboardMarkup()
+
+    for book in books:
+
+        title = book["title"]
+
+        if len(title) > 30:
+            title = title[:30] + "..."
+
+        markup.add(
+            types.InlineKeyboardButton(
+                f"⭐ {title} ({book['downloads']})",
+                callback_data=f"book_{book['id']}"
+            )
+        )
+
+    bot.send_message(
+        message.chat.id,
+        "⭐ <b>Mashhur kitoblar:</b>",
+        reply_markup=markup
+    )
+
+
+# =========================================================
+# KITOB YUBORISH
+# =========================================================
+
+@bot.message_handler(func=lambda m: m.text == "📤 Kitob yuborish")
+def upload_start(message):
+
+    msg = bot.send_message(
+        message.chat.id,
+        "📤 <b>Kitob yuborish</b>\n\n"
+        "PDF faylni yuboring."
+    )
+
+    bot.register_next_step_handler(msg, receive_pdf)
+
+
+def receive_pdf(message):
+
+    if not message.document:
+
+        bot.send_message(
+            message.chat.id,
+            "❌ Iltimos, PDF fayl yuboring."
+        )
+        return
+
+    document = message.document
+
+    file_name = document.file_name or "kitob.pdf"
+
+    if not file_name.lower().endswith(".pdf"):
+
+        bot.send_message(
+            message.chat.id,
+            "❌ Faqat PDF fayllar qabul qilinadi."
+        )
+        return
+
+    msg = bot.send_message(
+        message.chat.id,
+        "📖 Kitob nomini yozing:"
+    )
+
+    bot.register_next_step_handler(
+        msg,
+        save_received_book,
+        document.file_id,
+        file_name
+    )
+
+
+def save_received_book(message, file_id, file_name):
+
+    title = message.text.strip()
+
+    if not title:
+
+        bot.send_message(
+            message.chat.id,
+            "❌ Kitob nomi bo‘sh bo‘lmasin."
+        )
+        return
+
+    book_id = add_book(
+        title,
+        file_id,
+        file_name,
+        message.from_user.id
+    )
+
+    bot.send_message(
+        message.chat.id,
+        f"✅ <b>Kitob saqlandi!</b>\n\n"
+        f"📖 Nomi: <b>{title}</b>\n"
+        f"🆔 ID: <code>{book_id}</code>"
+    )
+
+
+# =========================================================
+# YORDAM
+# =========================================================
+
+@bot.message_handler(func=lambda m: m.text == "ℹ️ Yordam")
+def help_menu(message):
+
+    bot.send_message(
+        message.chat.id,
+        "ℹ️ <b>Yordam</b>\n\n"
+        "📚 Kitoblar — mavjud kitoblar\n"
+        "🔎 Qidirish — kitob qidirish\n"
+        "🆕 Yangi kitoblar — yangi qo‘shilganlar\n"
+        "⭐ Mashhur kitoblar — ko‘p olingan kitoblar\n"
+        "📤 Kitob yuborish — kutubxonaga kitob yuborish\n\n"
+        "Muammo bo‘lsa admin bilan bog‘laning."
+    )
+
+
+# =========================================================
+# ADMIN PANEL
+# =========================================================
+
+@bot.message_handler(func=lambda m: m.text == "🛠 Admin panel")
+def admin_panel(message):
+
+    if not is_admin(message.from_user.id):
+
+        bot.send_message(
+            message.chat.id,
+            "❌ Sizda Admin panelga kirish huquqi yo‘q."
+        )
+        return
+
+    markup = types.InlineKeyboardMarkup()
+
+    markup.add(
+        types.InlineKeyboardButton(
+            "📊 Statistika",
+            callback_data="admin_stats"
+        )
+    )
+
+    markup.add(
+        types.InlineKeyboardButton(
+            "📚 Kitoblar soni",
+            callback_data="admin_books"
+        )
+    )
+
+    markup.add(
+        types.InlineKeyboardButton(
+            "➕ Kitob qo‘shish",
+            callback_data="admin_add"
+        )
+    )
+
+    markup.add(
+        types.InlineKeyboardButton(
+            "🗑 Kitob o‘chirish",
+            callback_data="admin_delete"
+        )
+    )
+
+    bot.send_message(
+        message.chat.id,
+        "🛠 <b>ADMIN PANEL</b>\n\n"
+        "Kerakli bo‘limni tanlang:",
+        reply_markup=markup
+    )
+
+
+# =========================================================
+# ADMIN CALLBACK
+# =========================================================
+
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith("admin_")
+)
+def admin_callback(call):
+
+    if call.from_user.id != ADMIN_ID:
+
+        bot.answer_callback_query(
+            call.id,
+            "❌ Ruxsat yo‘q."
+        )
+        return
+
+    action = call.data
+
+    if action == "admin_stats":
+
+        con = db()
+        cur = con.cursor()
+
+        cur.execute("SELECT COUNT(*) FROM users")
+        users = cur.fetchone()[0]
+
+        cur.execute("SELECT COUNT(*) FROM books")
+        books = cur.fetchone()[0]
+
+        cur.execute(
+            "SELECT COALESCE(SUM(downloads), 0) FROM books"
+        )
+        downloads = cur.fetchone()[0]
+
+        con.close()
+
+        bot.send_message(
+            call.message.chat.id,
+            "📊 <b>STATISTIKA</b>\n\n"
+            f"👤 Foydalanuvchilar: <b>{users}</b>\n"
+            f"📚 Kitoblar: <b>{books}</b>\n"
+            f"⬇️ Yuklab olishlar: <b>{downloads}</b>"
+        )
+
+        bot.answer_callback_query(call.id)
+
+    elif action == "admin_books":
+
+        books = get_new_books()
+
+        if not books:
+
+            bot.send_message(
+                call.message.chat.id,
+                "📚 Kitoblar bazasi bo‘sh."
+            )
+
+        else:
+
+            text = "📚 <b>Kitoblar:</b>\n\n"
+
+            for book in books:
+
+                text += (
+                    f"🆔 <code>{book['id']}</code> — "
+                    f"{book['title']}\n"
+                )
+
+            bot.send_message(
+                call.message.chat.id,
+                text
+            )
+
+        bot.answer_callback_query(call.id)
+
+    elif action == "admin_add":
+
+        msg = bot.send_message(
+            call.message.chat.id,
+            "📤 PDF fayl yuboring."
+        )
+
+        bot.register_next_step_handler(
+            msg,
+            admin_receive_pdf
+        )
+
+        bot.answer_callback_query(call.id)
+
+    elif action == "admin_delete":
+
+        msg = bot.send_message(
+            call.message.chat.id,
+            "🗑 O‘chirmoqchi bo‘lgan kitob ID raqamini yuboring.\n\n"
+            "Masalan: <code>15</code>"
+        )
+
+        bot.register_next_step_handler(
+            msg,
+            admin_delete_book
+        )
+
+        bot.answer_callback_query(call.id)
+
+
+# =========================================================
+# ADMIN KITOB QO‘SHISH
+# =========================================================
+
+def admin_receive_pdf(message):
+
+    if not is_admin(message.from_user.id):
+        return
+
+    if not message.document:
+
+        bot.send_message(
+            message.chat.id,
+            "❌ PDF fayl yuboring."
+        )
+        return
+
+    file_name = message.document.file_name or "kitob.pdf"
+
+    if not file_name.lower().endswith(".pdf"):
+
+        bot.send_message(
+            message.chat.id,
+            "❌ Faqat PDF fayl."
+        )
+        return
+
+    msg = bot.send_message(
+        message.chat.id,
+        "📖 Kitob nomini yozing:"
+    )
+
+    bot.register_next_step_handler(
+        msg,
+        admin_save_book,
+        message.document.file_id,
+        file_name
+    )
+
+
+def admin_save_book(message, file_id, file_name):
+
+    if not is_admin(message.from_user.id):
+        return
+
+    title = message.text.strip()
+
+    if not title:
+
+        bot.send_message(
+            message.chat.id,
+            "❌ Nom yozilmadi."
+        )
+        return
+
+    book_id = add_book(
+        title,
+        file_id,
+        file_name,
+        message.from_user.id
+    )
+
+    bot.send_message(
+        message.chat.id,
+        "✅ <b>Kitob bazaga qo‘shildi!</b>\n\n"
+        f"📖 {title}\n"
+        f"🆔 ID: <code>{book_id}</code>"
+    )
+
+
+# =========================================================
+# ADMIN KITOB O‘CHIRISH
+# =========================================================
+
+def admin_delete_book(message):
+
+    if not is_admin(message.from_user.id):
+        return
+
+    if not message.text.isdigit():
+
+        bot.send_message(
+            message.chat.id,
+            "❌ Faqat kitob ID raqamini yuboring."
+        )
+        return
+
+    book_id = int(message.text)
+
+    if delete_book(book_id):
+
+        bot.send_message(
+            message.chat.id,
+            f"✅ <b>{book_id}</b>-ID kitob o‘chirildi."
+        )
+
+    else:
+
+        bot.send_message(
+            message.chat.id,
+            "❌ Bunday ID bilan kitob topilmadi."
+        )
+
+
+# =========================================================
+# NOMA'LUM XABAR
+# =========================================================
+
+@bot.message_handler(
+    content_types=[
+        "text",
+        "photo",
+        "video",
+        "audio",
+        "voice",
+        "document"
+    ]
+)
+def unknown_message(message):
+
+    if message.text:
+
+        bot.send_message(
+            message.chat.id,
+            "👇 Menyudan kerakli bo‘limni tanlang.",
+            reply_markup=main_menu(message.from_user.id)
+        )
+
+
+# =========================================================
+# BOTNI ISHGA TUSHIRISH
+# =========================================================
+
+print("===================================")
+print("📚 ONLAYN KUTUBXONA BOT")
+print("🤖 Bot ishga tushmoqda...")
+print("👤 Admin ID:", ADMIN_ID)
+print("===================================")
+
+while True:
+
+    try:
+        bot.infinity_polling(
+            timeout=30,
+            long_polling_timeout=30
+        )
+
+    except Exception as e:
+
+        print("BOT ERROR:", e)
+
+        time.sleep(5)
